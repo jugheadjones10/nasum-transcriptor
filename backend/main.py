@@ -1,896 +1,1095 @@
 """
-Nasum Transcriptor - Vocal Melody & Chord Transcription Backend
-Transcribes vocal melodies and detects chord progressions from YouTube music
+Lead Sheet Transcriptor Backend
+Converts YouTube audio to lead sheets with melody and chord symbols.
+
+Pipeline (Step-by-step with user review):
+1. Download + Separate: Get audio, split vocals/accompaniment
+2. Transcribe: Convert vocals to MIDI notes using basic_pitch
+3. Detect Chords: Analyze accompaniment for chord progression
+4. Generate: Create quantized MusicXML lead sheet
 """
-
-import os
-
-# MUST be set before any PyTorch imports - enables CPU fallback for MPS unsupported ops
-os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 
 import asyncio
 import json
-import logging
 import re
-import shutil
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from enum import Enum
 from pathlib import Path
-from typing import List, Optional
-from urllib.parse import parse_qs, urlparse
+from typing import Optional
 
+import librosa
 import numpy as np
-import yt_dlp
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
-)
-logger = logging.getLogger(__name__)
+# =============================================================================
+# Configuration
+# =============================================================================
+
+BASE_DIR = Path(__file__).parent
+OUTPUTS_DIR = BASE_DIR / "outputs"
+CACHE_DIR = BASE_DIR / "cache"
+
+OUTPUTS_DIR.mkdir(exist_ok=True)
+CACHE_DIR.mkdir(exist_ok=True)
+
+# =============================================================================
+# FastAPI App
+# =============================================================================
 
 app = FastAPI(
-    title="Nasum Transcriptor API",
-    description="Transcribe vocal melodies with chord notations from YouTube music",
-    version="2.0.0",
+    title="Lead Sheet Transcriptor",
+    description="Convert YouTube audio to lead sheets (melody + chords)",
+    version="0.2.0",
 )
 
-# CORS configuration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
-    allow_credentials=True,
+    allow_origins=["*"],  # Allow all origins for development
+    allow_credentials=False,  # Can't use credentials with allow_origins=["*"]
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Storage for job status
-jobs: dict = {}
-
-# Thread pool for blocking operations
-executor = ThreadPoolExecutor(max_workers=2)
-
-# Ensure directories exist
-OUTPUT_DIR = Path("outputs")
-OUTPUT_DIR.mkdir(exist_ok=True)
-
-CACHE_DIR = Path("cache")
-CACHE_DIR.mkdir(exist_ok=True)
+# =============================================================================
+# Models
+# =============================================================================
 
 
-class TranscriptionRequest(BaseModel):
+class JobStep(str, Enum):
+    """Current step in the pipeline."""
+
+    IDLE = "idle"
+    DOWNLOADING = "downloading"
+    SEPARATING = "separating"
+    SEPARATED = "separated"  # Waiting for user to continue
+    TRANSCRIBING = "transcribing"
+    TRANSCRIBED = "transcribed"  # Waiting for user to continue
+    DETECTING_CHORDS = "detecting_chords"
+    CHORDS_DETECTED = "chords_detected"  # Waiting for user to continue
+    GENERATING = "generating"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class MelodyNote(BaseModel):
+    """A single note in the melody."""
+
+    pitch: int  # MIDI pitch (60 = C4)
+    start_time: float  # seconds
+    duration: float  # seconds
+    velocity: int = 100
+
+
+class ChordEvent(BaseModel):
+    """A chord at a specific time."""
+
+    time: float  # seconds
+    chord: str  # e.g., "Cmaj", "Am7", "G"
+    confidence: float = 1.0
+
+
+class ProcessRequest(BaseModel):
     youtube_url: str
 
 
-class ContinueRequest(BaseModel):
+class JobResponse(BaseModel):
     job_id: str
+    step: JobStep
+    progress: int = 0
+    message: str = ""
 
+    # Metadata
+    title: Optional[str] = None
+    duration: Optional[float] = None  # seconds
+    bpm: Optional[float] = None
+    key: Optional[str] = None
+    time_signature: str = "4/4"
 
-class SeparatedTrack(BaseModel):
-    name: str
-    url: str
+    # Step 1 outputs
+    vocals_url: Optional[str] = None
+    accompaniment_url: Optional[str] = None
+    original_url: Optional[str] = None
 
+    # Step 2 outputs
+    melody_notes: Optional[list[MelodyNote]] = None
+    melody_midi_url: Optional[str] = None
 
-class JobStatus(BaseModel):
-    job_id: str
-    status: str
-    progress: int
-    message: str
-    cached: Optional[bool] = None
-    video_title: Optional[str] = None
-    separated_tracks: Optional[List[SeparatedTrack]] = None
-    midi_url: Optional[str] = None
-    abc_notation: Optional[str] = None
-    chords: Optional[List[dict]] = None
+    # Step 3 outputs
+    chords: Optional[list[ChordEvent]] = None
+
+    # Step 4 outputs
+    music_xml_url: Optional[str] = None
+
     error: Optional[str] = None
 
 
-# Chord templates for detection
-CHORD_TEMPLATES = {
-    "C": [1, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0],
-    "Cm": [1, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0],
-    "C#": [0, 1, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0],
-    "C#m": [0, 1, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0],
-    "D": [0, 0, 1, 0, 0, 0, 1, 0, 0, 1, 0, 0],
-    "Dm": [0, 0, 1, 0, 0, 1, 0, 0, 0, 1, 0, 0],
-    "D#": [0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 1, 0],
-    "D#m": [0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 1, 0],
-    "E": [0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 1],
-    "Em": [0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 1],
-    "F": [1, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0],
-    "Fm": [1, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0],
-    "F#": [0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0],
-    "F#m": [0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0],
-    "G": [0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 1],
-    "Gm": [0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 1],
-    "G#": [1, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0],
-    "G#m": [1, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0],
-    "A": [0, 1, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0],
-    "Am": [1, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0],
-    "A#": [0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 1, 0],
-    "A#m": [0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0],
-    "B": [0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 1],
-    "Bm": [0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 1],
-}
+# In-memory job storage
+jobs: dict[str, JobResponse] = {}
+
+# =============================================================================
+# Helper Functions
+# =============================================================================
 
 
-def extract_video_id(youtube_url: str) -> Optional[str]:
-    """Extract video ID from various YouTube URL formats."""
-    # Try different URL patterns
+def extract_video_id(url: str) -> Optional[str]:
+    """Extract YouTube video ID from URL."""
     patterns = [
-        r"(?:v=|/v/|youtu\.be/)([a-zA-Z0-9_-]{11})",
-        r"(?:embed/)([a-zA-Z0-9_-]{11})",
-        r"(?:shorts/)([a-zA-Z0-9_-]{11})",
+        r"(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/embed/)([a-zA-Z0-9_-]{11})",
+        r"youtube\.com/shorts/([a-zA-Z0-9_-]{11})",
     ]
-
     for pattern in patterns:
-        match = re.search(pattern, youtube_url)
+        match = re.search(pattern, url)
         if match:
             return match.group(1)
-
-    # Try parsing as query parameter
-    parsed = urlparse(youtube_url)
-    if parsed.query:
-        params = parse_qs(parsed.query)
-        if "v" in params:
-            return params["v"][0]
-
     return None
 
 
-def get_cache_path(video_id: str) -> Path:
-    """Get the cache directory path for a video ID."""
-    return CACHE_DIR / video_id
+def get_job_dir(job_id: str) -> Path:
+    """Get the output directory for a job."""
+    return OUTPUTS_DIR / job_id
 
 
-def is_cached(video_id: str) -> bool:
-    """Check if separation results are cached for this video."""
-    cache_path = get_cache_path(video_id)
-    if not cache_path.exists():
-        return False
-
-    # Check if we have at least vocals and some form of instrumental
-    has_vocals = (cache_path / "vocals.wav").exists()
-    has_instrumental = (cache_path / "instrumental.wav").exists() or (
-        cache_path / "other.wav"
-    ).exists()
-    has_original = (cache_path / "original.wav").exists()
-
-    if not (has_vocals and has_instrumental and has_original):
-        return False
-
-    # Check if metadata exists
-    if not (cache_path / "metadata.json").exists():
-        return False
-
-    return True
+def midi_note_to_name(midi_note: int) -> str:
+    """Convert MIDI note number to note name."""
+    notes = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+    octave = (midi_note // 12) - 1
+    note = notes[midi_note % 12]
+    return f"{note}{octave}"
 
 
-def get_cached_metadata(video_id: str) -> Optional[dict]:
-    """Get cached metadata for a video."""
-    cache_path = get_cache_path(video_id)
-    metadata_path = cache_path / "metadata.json"
-
-    if metadata_path.exists():
-        with open(metadata_path, "r") as f:
-            return json.load(f)
-    return None
+# =============================================================================
+# Step 1: Download + Separation
+# =============================================================================
 
 
-def save_cache_metadata(video_id: str, metadata: dict):
-    """Save metadata to cache."""
-    cache_path = get_cache_path(video_id)
-    cache_path.mkdir(exist_ok=True)
+async def download_audio(
+    job_id: str, youtube_url: str, output_dir: Path
+) -> tuple[Path, str]:
+    """Download audio from YouTube using yt-dlp."""
+    jobs[job_id].step = JobStep.DOWNLOADING
+    jobs[job_id].message = "Downloading audio from YouTube..."
+    jobs[job_id].progress = 5
 
-    with open(cache_path / "metadata.json", "w") as f:
-        json.dump(metadata, f, indent=2)
+    output_template = str(output_dir / "original.%(ext)s")
 
+    # First, get the title
+    title_cmd = ["yt-dlp", "--print", "%(title)s", "--no-playlist", youtube_url]
+    title_result = await asyncio.create_subprocess_exec(
+        *title_cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    title_stdout, _ = await title_result.communicate()
+    title = title_stdout.decode().strip().split("\n")[0] if title_stdout else "Unknown"
 
-def copy_from_cache(video_id: str, job_dir: Path) -> dict:
-    """Copy cached stems to job directory."""
-    cache_path = get_cache_path(video_id)
-    stems = {}
+    print(f"[{job_id}] Title: {title}")
+    jobs[job_id].title = title
+    jobs[job_id].progress = 8
 
-    # Handle both old (demucs) and new (audio-separator) stem names
-    stem_names = ["vocals", "instrumental", "drums", "bass", "other", "original"]
+    # Then download the audio
+    cmd = [
+        "yt-dlp",
+        "-f",
+        "bestaudio",
+        "-x",
+        "--audio-format",
+        "wav",
+        "-o",
+        output_template,
+        "--no-playlist",
+        "--no-warnings",
+        youtube_url,
+    ]
 
-    for stem_name in stem_names:
-        src = cache_path / f"{stem_name}.wav"
-        if src.exists():
-            dest = job_dir / f"{stem_name}.wav"
-            shutil.copy(src, dest)
-            stems[stem_name] = dest
-            logger.info(f"📦 Copied from cache: {stem_name}")
+    print(f"[{job_id}] Downloading with: {' '.join(cmd)}")
 
-    # Ensure "other" exists for chord detection (use instrumental if no "other")
-    if "instrumental" in stems and "other" not in stems:
-        stems["other"] = stems["instrumental"]
+    result = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await result.communicate()
 
-    return stems
+    print(f"[{job_id}] yt-dlp exit code: {result.returncode}")
+    if stderr:
+        print(f"[{job_id}] yt-dlp stderr: {stderr.decode()[:500]}")
 
+    if result.returncode != 0:
+        raise Exception(f"yt-dlp failed: {stderr.decode()}")
 
-def save_to_cache(video_id: str, stems: dict, metadata: dict):
-    """Save stems to cache for future use."""
-    cache_path = get_cache_path(video_id)
-    cache_path.mkdir(exist_ok=True)
+    audio_path = output_dir / "original.wav"
 
-    for stem_name, stem_path in stems.items():
-        if stem_path and Path(stem_path).exists():
-            dest = cache_path / f"{stem_name}.wav"
-            if not dest.exists():
-                shutil.copy(stem_path, dest)
-                logger.info(f"💾 Cached: {stem_name}")
-
-    save_cache_metadata(video_id, metadata)
-    logger.info(f"💾 Cache saved for video: {video_id}")
-
-
-def download_audio(youtube_url: str, output_path: Path) -> tuple[Path, dict]:
-    """Download audio from YouTube video. Returns (audio_path, video_info)."""
-    logger.info(f"📥 Downloading audio from: {youtube_url}")
-
-    ydl_opts = {
-        "format": "bestaudio/best",
-        "postprocessors": [
-            {
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "wav",
-                "preferredquality": "192",
-            }
-        ],
-        "outtmpl": str(output_path / "audio"),
-        "quiet": False,
-        "no_warnings": False,
-    }
-
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(youtube_url, download=True)
-        video_info = {
-            "title": info.get("title", "Unknown"),
-            "id": info.get("id", ""),
-            "duration": info.get("duration", 0),
-            "uploader": info.get("uploader", ""),
-        }
-        logger.info(f"📥 Downloaded: {video_info['title']}")
-
-    audio_path = output_path / "audio.wav"
     if not audio_path.exists():
-        for f in output_path.glob("*.wav"):
-            audio_path = f
-            break
-        else:
-            for f in output_path.glob("audio.*"):
-                audio_path = f
-                break
+        # Check if there's a webm or other file that didn't get converted
+        for ext in ["webm", "opus", "m4a", "mp3"]:
+            alt_path = output_dir / f"original.{ext}"
+            if alt_path.exists():
+                raise Exception(f"Audio downloaded as {ext} but WAV conversion failed")
+        raise Exception("Audio file not found after download")
 
-    logger.info(f"✅ Audio saved to: {audio_path}")
-    return audio_path, video_info
+    # Get duration
+    y, sr = librosa.load(
+        str(audio_path), sr=None, duration=10
+    )  # Just load first 10s for duration check
+    full_duration = librosa.get_duration(path=str(audio_path))
+
+    jobs[job_id].title = title
+    jobs[job_id].duration = full_duration
+    jobs[job_id].original_url = f"/api/audio/{job_id}/original"
+    jobs[job_id].progress = 15
+
+    return audio_path, title
 
 
-def separate_all_stems(audio_path: Path, output_path: Path) -> dict:
-    """Separate audio into stems using audio-separator with BS Roformer (SOTA)."""
-    import torch
+async def separate_stems(
+    job_id: str, audio_path: Path, output_dir: Path
+) -> tuple[Path, Path]:
+    """Separate audio into vocals and accompaniment using Demucs."""
+    jobs[job_id].step = JobStep.SEPARATING
+    jobs[
+        job_id
+    ].message = "Separating vocals and accompaniment (this may take a few minutes)..."
+    jobs[job_id].progress = 20
 
-    # Disable MPS to avoid FFT/ComplexFloat issues on Apple Silicon
-    # Must be done before importing Separator
-    torch.backends.mps.is_available = lambda: False
-    torch.backends.mps.is_built = lambda: False
+    cmd = [
+        "python",
+        "-m",
+        "demucs",
+        "--two-stems",
+        "vocals",
+        "-n",
+        "htdemucs",
+        "-o",
+        str(output_dir),
+        str(audio_path),
+    ]
 
-    from audio_separator.separator import Separator
-
-    logger.info("🎤 Separating audio with audio-separator (BS Roformer)...")
-    logger.info("   This may take several minutes (running on CPU)...")
-
-    # Initialize separator - will use CPU since MPS is disabled
-    separator = Separator(
-        output_dir=str(output_path),
-        output_format="wav",
+    result = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
     )
+    stdout, stderr = await result.communicate()
 
-    # Load BS Roformer model (best for vocals) - will download on first use
-    # Alternative models: "htdemucs_ft.yaml", "MDX23C-8KFFT-InstVoc_HQ.ckpt"
+    if result.returncode != 0:
+        raise Exception(f"Demucs failed: {stderr.decode()}")
+
+    demucs_output = output_dir / "htdemucs" / "original"
+    vocals_path = demucs_output / "vocals.wav"
+    accompaniment_path = demucs_output / "no_vocals.wav"
+
+    if not vocals_path.exists() or not accompaniment_path.exists():
+        raise Exception("Separated stems not found")
+
+    jobs[job_id].vocals_url = f"/api/audio/{job_id}/vocals"
+    jobs[job_id].accompaniment_url = f"/api/audio/{job_id}/accompaniment"
+    jobs[job_id].progress = 40
+
+    return vocals_path, accompaniment_path
+
+
+async def run_step1(job_id: str, youtube_url: str):
+    """Execute Step 1: Download and Separate."""
+    output_dir = get_job_dir(job_id)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
     try:
-        separator.load_model(model_filename="model_bs_roformer_ep_317_sdr_12.9755.ckpt")
-        logger.info("✅ Loaded BS Roformer model")
+        audio_path, title = await download_audio(job_id, youtube_url, output_dir)
+        print(f"[{job_id}] Downloaded: {title}")
+
+        vocals_path, accompaniment_path = await separate_stems(
+            job_id, audio_path, output_dir
+        )
+        print(f"[{job_id}] Separated stems")
+
+        # Detect BPM from accompaniment
+        y, sr = librosa.load(str(accompaniment_path), sr=22050)
+        tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
+        jobs[job_id].bpm = (
+            float(tempo) if isinstance(tempo, (int, float)) else float(tempo[0])
+        )
+
+        jobs[job_id].step = JobStep.SEPARATED
+        jobs[
+            job_id
+        ].message = "✓ Separation complete. Review the stems and continue when ready."
+        jobs[job_id].progress = 40
+
     except Exception as e:
-        logger.warning(f"⚠️ BS Roformer failed, trying fallback model: {e}")
-        # Fallback to a more compatible model
-        separator.load_model(model_filename="htdemucs_ft.yaml")
-        logger.info("✅ Loaded htdemucs_ft model (fallback)")
-
-    # Perform separation
-    logger.info(f"🔄 Processing: {audio_path}")
-    output_files = separator.separate(str(audio_path))
-
-    logger.info("✅ Source separation complete")
-
-    # Map output files to stem names
-    stems = {}
-    stems["original"] = audio_path
-
-    for output_file in output_files:
-        output_path_file = Path(output_file)
-        filename_lower = output_path_file.stem.lower()
-
-        # Determine stem type from filename
-        if "vocal" in filename_lower or "vocals" in filename_lower:
-            stems["vocals"] = output_path_file
-            logger.info(f"✅ Found vocals: {output_path_file}")
-        elif (
-            "instrumental" in filename_lower
-            or "instrum" in filename_lower
-            or "no_vocal" in filename_lower
-        ):
-            stems["instrumental"] = output_path_file
-            logger.info(f"✅ Found instrumental: {output_path_file}")
-        elif "drum" in filename_lower:
-            stems["drums"] = output_path_file
-            logger.info(f"✅ Found drums: {output_path_file}")
-        elif "bass" in filename_lower:
-            stems["bass"] = output_path_file
-            logger.info(f"✅ Found bass: {output_path_file}")
-        elif "other" in filename_lower:
-            stems["other"] = output_path_file
-            logger.info(f"✅ Found other: {output_path_file}")
-        else:
-            # If we can't identify, check if it's the only non-vocal output
-            if "vocals" in stems and "instrumental" not in stems:
-                stems["instrumental"] = output_path_file
-                logger.info(f"✅ Found instrumental (inferred): {output_path_file}")
-
-    # If we only got vocals + instrumental, that's fine for our use case
-    # The instrumental can be used for chord detection
-    if "instrumental" in stems and "other" not in stems:
-        stems["other"] = stems["instrumental"]
-
-    return stems
+        print(f"[{job_id}] Step 1 error: {e}")
+        jobs[job_id].step = JobStep.FAILED
+        jobs[job_id].error = str(e)
+        jobs[job_id].message = "Step 1 failed"
 
 
-def copy_stems_for_serving(job_id: str, stems: dict) -> List[SeparatedTrack]:
-    """Copy stems to a servable location and return track info."""
-    job_dir = OUTPUT_DIR / job_id
-    tracks = []
+# =============================================================================
+# Step 2: Transcription (basic_pitch)
+# =============================================================================
 
-    for name, path in stems.items():
-        if path and Path(path).exists():
-            dest = job_dir / f"{name}.wav"
-            if Path(path) != dest and not dest.exists():
-                shutil.copy(path, dest)
 
-            tracks.append(
-                SeparatedTrack(
-                    name=name.replace("_", " ").title(),
-                    url=f"/api/audio/{job_id}/{name}",
-                )
+async def transcribe_melody(
+    job_id: str, vocals_path: Path, output_dir: Path
+) -> list[MelodyNote]:
+    """Transcribe vocals to MIDI notes using basic_pitch."""
+    jobs[job_id].step = JobStep.TRANSCRIBING
+    jobs[job_id].message = "Transcribing melody from vocals..."
+    jobs[job_id].progress = 45
+
+    from basic_pitch.inference import predict
+
+    # Run prediction
+    model_output, midi_data, note_events = predict(str(vocals_path))
+
+    # Convert to our format
+    notes = []
+    for start, end, pitch, velocity, _ in note_events:
+        notes.append(
+            MelodyNote(
+                pitch=int(pitch),
+                start_time=float(start),
+                duration=float(end - start),
+                velocity=int(velocity * 127),
             )
+        )
 
-    return tracks
+    # Sort by start time
+    notes.sort(key=lambda n: n.start_time)
 
+    # Save MIDI file
+    midi_path = output_dir / "melody.mid"
+    midi_data.write(str(midi_path))
 
-def transcribe_vocal_melody(audio_path: Path, output_path: Path) -> Path:
-    """Transcribe vocal melody to MIDI using basic-pitch."""
-    logger.info("🎼 Transcribing vocal melody to MIDI...")
+    jobs[job_id].melody_midi_url = f"/api/audio/{job_id}/melody_midi"
+    jobs[job_id].progress = 60
 
-    from basic_pitch import ICASSP_2022_MODEL_PATH
-    from basic_pitch.inference import predict_and_save
-
-    predict_and_save(
-        [str(audio_path)],
-        str(output_path),
-        save_midi=True,
-        sonify_midi=False,
-        save_model_outputs=False,
-        save_notes=False,
-        model_or_model_path=ICASSP_2022_MODEL_PATH,
-    )
-
-    for p in output_path.glob("*.mid"):
-        logger.info(f"✅ Vocal melody MIDI generated: {p}")
-        return p
-
-    raise FileNotFoundError("MIDI file not generated")
+    return notes
 
 
-def detect_chords(audio_path: Path, hop_length: int = 22050) -> List[dict]:
-    """Detect chord progression from accompaniment audio."""
-    logger.info("🎸 Detecting chord progression...")
+def run_step2_sync(job_id: str, vocals_path: Path, output_dir: Path):
+    """Synchronous transcription using basic_pitch (CPU-bound)."""
+    from basic_pitch.inference import predict
 
-    import librosa
+    print(f"[{job_id}] Starting basic_pitch prediction on {vocals_path}")
+    model_output, midi_data, note_events = predict(str(vocals_path))
 
+    notes = []
+    for start, end, pitch, velocity, _ in note_events:
+        notes.append(
+            MelodyNote(
+                pitch=int(pitch),
+                start_time=float(start),
+                duration=float(end - start),
+                velocity=int(velocity * 127),
+            )
+        )
+
+    notes.sort(key=lambda n: n.start_time)
+
+    midi_path = output_dir / "melody.mid"
+    midi_data.write(str(midi_path))
+    print(f"[{job_id}] Saved MIDI to {midi_path}")
+
+    return notes
+
+
+async def run_step2(job_id: str):
+    """Execute Step 2: Transcribe melody."""
+    output_dir = get_job_dir(job_id)
+    vocals_path = output_dir / "htdemucs" / "original" / "vocals.wav"
+
+    try:
+        jobs[job_id].step = JobStep.TRANSCRIBING
+        jobs[job_id].message = "Transcribing melody from vocals..."
+        jobs[job_id].progress = 45
+
+        if not vocals_path.exists():
+            raise Exception(f"Vocals file not found: {vocals_path}")
+
+        print(
+            f"[{job_id}] Vocals file exists: {vocals_path}, size: {vocals_path.stat().st_size}"
+        )
+
+        # Run CPU-bound transcription in executor
+        loop = asyncio.get_event_loop()
+        notes = await loop.run_in_executor(
+            None, run_step2_sync, job_id, vocals_path, output_dir
+        )
+
+        jobs[job_id].melody_notes = notes
+        jobs[job_id].melody_midi_url = f"/api/audio/{job_id}/melody_midi"
+
+        print(f"[{job_id}] Transcribed {len(notes)} notes")
+
+        jobs[job_id].step = JobStep.TRANSCRIBED
+        jobs[
+            job_id
+        ].message = f"✓ Transcribed {len(notes)} melody notes. Review and continue."
+        jobs[job_id].progress = 60
+
+    except Exception as e:
+        print(f"[{job_id}] Step 2 error: {e}")
+        import traceback
+
+        traceback.print_exc()
+        jobs[job_id].step = JobStep.FAILED
+        jobs[job_id].error = str(e)
+        jobs[job_id].message = "Transcription failed"
+
+
+# =============================================================================
+# Step 3: Chord Detection
+# =============================================================================
+
+CHORD_TEMPLATES = {
+    "maj": [1, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0],
+    "min": [1, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0],
+    "7": [1, 0, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0],
+    "maj7": [1, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 1],
+    "min7": [1, 0, 0, 1, 0, 0, 0, 1, 0, 0, 1, 0],
+    "dim": [1, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0],
+    "aug": [1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0],
+    "sus4": [1, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0],
+    "sus2": [1, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0],
+}
+
+NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+
+
+def detect_chord_at_frame(chroma: np.ndarray) -> tuple[str, float]:
+    """Detect the most likely chord from a chroma vector."""
+    best_chord = "N"  # No chord
+    best_score = 0.0
+
+    for root in range(12):
+        for chord_type, template in CHORD_TEMPLATES.items():
+            # Rotate template to match root
+            rotated = np.roll(template, root)
+            # Compute correlation
+            score = np.corrcoef(chroma, rotated)[0, 1]
+            if not np.isnan(score) and score > best_score:
+                best_score = score
+                root_name = NOTE_NAMES[root]
+                if chord_type == "maj":
+                    best_chord = root_name
+                elif chord_type == "min":
+                    best_chord = f"{root_name}m"
+                else:
+                    best_chord = f"{root_name}{chord_type}"
+
+    return best_chord, best_score
+
+
+def detect_chords_from_audio(audio_path: Path, bpm: float) -> list[ChordEvent]:
+    """Detect chords from audio file."""
     y, sr = librosa.load(str(audio_path), sr=22050)
-    chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=hop_length)
 
-    template_names = list(CHORD_TEMPLATES.keys())
-    template_matrix = np.array([CHORD_TEMPLATES[name] for name in template_names])
+    # Get hop length for ~1 beat resolution
+    beat_duration = 60.0 / bpm
+    hop_length = int(sr * beat_duration / 2)  # 2 analyses per beat
+
+    # Compute chroma features
+    chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=hop_length)
 
     chords = []
     prev_chord = None
 
-    for i in range(chroma.shape[1]):
-        frame_chroma = chroma[:, i]
+    for i, frame in enumerate(chroma.T):
+        time = i * hop_length / sr
+        chord, confidence = detect_chord_at_frame(frame)
 
-        if np.sum(frame_chroma) > 0:
-            frame_chroma = frame_chroma / np.sum(frame_chroma)
-
-        best_match = None
-        best_score = -1
-
-        for j, template in enumerate(template_matrix):
-            template_norm = (
-                template / np.sum(template) if np.sum(template) > 0 else template
-            )
-            score = np.dot(frame_chroma, template_norm)
-            if score > best_score:
-                best_score = score
-                best_match = template_names[j]
-
-        time_sec = i * hop_length / sr
-
-        if best_match != prev_chord and best_score > 0.3:
+        # Only add if chord changed
+        if chord != prev_chord and confidence > 0.5:
             chords.append(
+                ChordEvent(
+                    time=time,
+                    chord=chord,
+                    confidence=confidence,
+                )
+            )
+            prev_chord = chord
+
+    return chords
+
+
+def detect_key(audio_path: Path) -> str:
+    """Detect the musical key of the audio."""
+    y, sr = librosa.load(str(audio_path), sr=22050)
+    chroma = librosa.feature.chroma_cqt(y=y, sr=sr)
+    chroma_avg = np.mean(chroma, axis=1)
+
+    # Simple key detection: find the most prominent pitch class
+    # and determine if major or minor based on third
+    root = np.argmax(chroma_avg)
+    root_name = NOTE_NAMES[root]
+
+    # Check major vs minor (look at relative strength of major/minor third)
+    major_third = chroma_avg[(root + 4) % 12]
+    minor_third = chroma_avg[(root + 3) % 12]
+
+    if major_third > minor_third:
+        return f"{root_name} major"
+    else:
+        return f"{root_name} minor"
+
+
+async def run_step3(job_id: str):
+    """Execute Step 3: Detect chords."""
+    output_dir = get_job_dir(job_id)
+    accompaniment_path = output_dir / "htdemucs" / "original" / "no_vocals.wav"
+
+    try:
+        jobs[job_id].step = JobStep.DETECTING_CHORDS
+        jobs[job_id].message = "Analyzing chord progression..."
+        jobs[job_id].progress = 65
+
+        bpm = jobs[job_id].bpm or 120.0
+
+        # Detect chords
+        chords = detect_chords_from_audio(accompaniment_path, bpm)
+
+        # Detect key
+        key = detect_key(accompaniment_path)
+
+        jobs[job_id].chords = chords
+        jobs[job_id].key = key
+
+        print(f"[{job_id}] Detected {len(chords)} chord changes, key: {key}")
+
+        # Save chords to file
+        chords_data = [
+            {"time": c.time, "chord": c.chord, "confidence": c.confidence}
+            for c in chords
+        ]
+        with open(output_dir / "chords.json", "w") as f:
+            json.dump({"key": key, "chords": chords_data}, f, indent=2)
+
+        jobs[job_id].step = JobStep.CHORDS_DETECTED
+        jobs[
+            job_id
+        ].message = f"✓ Detected {len(chords)} chords in {key}. Review and continue."
+        jobs[job_id].progress = 80
+
+    except Exception as e:
+        print(f"[{job_id}] Step 3 error: {e}")
+        jobs[job_id].step = JobStep.FAILED
+        jobs[job_id].error = str(e)
+        jobs[job_id].message = "Chord detection failed"
+
+
+# =============================================================================
+# Step 4: Generate MusicXML
+# =============================================================================
+
+
+def quantize_time(time: float, bpm: float, subdivision: int = 16) -> float:
+    """Quantize time to nearest subdivision of a beat."""
+    beat_duration = 60.0 / bpm
+    subdivision_duration = beat_duration / (subdivision / 4)
+    return round(time / subdivision_duration) * subdivision_duration
+
+
+def quantize_duration(duration: float, bpm: float, min_note: int = 16) -> float:
+    """Quantize duration to nearest note value."""
+    beat_duration = 60.0 / bpm
+    min_duration = beat_duration / (min_note / 4)
+    quantized = max(min_duration, round(duration / min_duration) * min_duration)
+    return quantized
+
+
+def snap_to_valid_duration(quarter_length: float) -> float:
+    """Snap a duration to a valid music notation value (in quarter notes)."""
+    # Valid durations: whole=4, half=2, quarter=1, eighth=0.5, sixteenth=0.25, thirty-second=0.125
+    # Also with dots: dotted half=3, dotted quarter=1.5, dotted eighth=0.75
+    valid_durations = [4, 3, 2, 1.5, 1, 0.75, 0.5, 0.375, 0.25, 0.1875, 0.125]
+
+    # Find closest valid duration
+    closest = min(valid_durations, key=lambda x: abs(x - quarter_length))
+    return closest
+
+
+def generate_musicxml(
+    notes: list[MelodyNote],
+    chords: list[ChordEvent],
+    bpm: float,
+    key: str,
+    title: str,
+    time_sig: str = "4/4",
+) -> str:
+    """Generate MusicXML lead sheet using music21."""
+    from music21 import harmony, metadata, meter, note, stream, tempo
+    from music21 import key as m21key
+
+    # Create score
+    score = stream.Score()
+    score.metadata = metadata.Metadata()
+    score.metadata.title = title
+
+    # Create part for melody
+    melody_part = stream.Part()
+    melody_part.id = "Melody"
+
+    # Add tempo
+    melody_part.append(tempo.MetronomeMark(number=bpm))
+
+    # Add time signature
+    num, denom = map(int, time_sig.split("/"))
+    melody_part.append(meter.TimeSignature(time_sig))
+
+    # Add key signature
+    # music21 accepts both "C#" and "c#" for sharp keys
+    key_name = key.split()[0] if key else "C"
+    is_minor = "minor" in key.lower() if key else False
+    
+    # Use enharmonic equivalents for keys with > 6 sharps/flats
+    # These are unusual keys that OSMD can't render
+    enharmonic_map = {
+        "G#": "Ab", "A#": "Bb", "D#": "Eb", "E#": "F",
+        "B#": "C", "Fb": "E", "Cb": "B",
+        # Also map double sharps/flats
+        "F##": "G", "C##": "D", "G##": "A", "D##": "E", "A##": "B", "E##": "F#", "B##": "C#",
+    }
+    if key_name in enharmonic_map:
+        key_name = enharmonic_map[key_name]
+    
+    try:
+        ks = m21key.Key(key_name, "minor" if is_minor else "major")
+        melody_part.append(ks)
+    except Exception as e:
+        print(f"Could not create key signature for {key}: {e}")
+        # Fall back to C major
+        try:
+            ks = m21key.Key("C", "major")
+            melody_part.append(ks)
+        except:
+            pass
+
+    # Calculate timing
+    beat_duration_seconds = 60.0 / bpm
+    measure_duration_seconds = beat_duration_seconds * num
+
+    # Convert notes to quarter-length based timing
+    quantized_notes = []
+    for n in notes:
+        # Convert time from seconds to quarter notes
+        start_quarters = n.start_time / beat_duration_seconds
+        duration_quarters = n.duration / beat_duration_seconds
+
+        # Snap to 16th note grid
+        start_quarters = round(start_quarters * 4) / 4
+        duration_quarters = snap_to_valid_duration(duration_quarters)
+
+        if duration_quarters > 0:
+            quantized_notes.append(
                 {
-                    "time": round(time_sec, 2),
-                    "chord": best_match,
-                    "confidence": round(float(best_score), 2),
+                    "pitch": n.pitch,
+                    "start": start_quarters,
+                    "duration": duration_quarters,
                 }
             )
-            prev_chord = best_match
 
-    simplified_chords = []
-    for i, chord in enumerate(chords):
-        if i == len(chords) - 1:
-            simplified_chords.append(chord)
-        elif chords[i + 1]["time"] - chord["time"] >= 0.5:
-            simplified_chords.append(chord)
-
-    logger.info(f"✅ Detected {len(simplified_chords)} chord changes")
-    return simplified_chords
-
-
-def midi_to_abc_with_chords(midi_path: Path, chords: List[dict]) -> str:
-    """Convert MIDI melody to ABC notation with chord symbols."""
-    logger.info("📜 Generating lead sheet with melody and chords...")
-
-    import pretty_midi
-
-    midi_data = pretty_midi.PrettyMIDI(str(midi_path))
-
-    all_notes = []
-    for instrument in midi_data.instruments:
-        if not instrument.is_drum:
-            for note in instrument.notes:
-                all_notes.append(
-                    {
-                        "pitch": note.pitch,
-                        "start": note.start,
-                        "end": note.end,
-                        "duration": note.end - note.start,
-                        "velocity": note.velocity,
-                    }
-                )
-
-    all_notes.sort(key=lambda x: x["start"])
-    logger.info(f"   Found {len(all_notes)} melody notes")
-
-    if not all_notes:
-        return "X:1\nT:Transcribed Melody\nM:4/4\nL:1/8\nK:C\nz8|"
-
-    key = estimate_key(chords) if chords else "C"
-
-    abc = "X:1\n"
-    abc += "T:Transcribed Vocal Melody\n"
-    abc += "C:Auto-transcribed\n"
-    abc += "M:4/4\n"
-    abc += "L:1/8\n"
-    abc += f"K:{key}\n"
-    abc += "%%stretchlast\n"
-
-    note_names = ["C", "^C", "D", "^D", "E", "F", "^F", "G", "^G", "A", "^A", "B"]
-
-    def pitch_to_abc(pitch: int) -> str:
-        octave = pitch // 12 - 1
-        note_idx = pitch % 12
-        note = note_names[note_idx]
-
-        if octave >= 5:
-            note = note.lower()
-            octave_marks = "'" * (octave - 5)
-        else:
-            octave_marks = "," * (4 - octave)
-
-        return note + octave_marks
-
-    bpm = midi_data.estimate_tempo() if midi_data.estimate_tempo() > 0 else 120
-    seconds_per_beat = 60.0 / bpm
-    seconds_per_measure = seconds_per_beat * 4
-
-    measures = []
-
-    for note in all_notes[:300]:
-        measure_idx = int(note["start"] / seconds_per_measure)
-        beat_in_measure = (note["start"] % seconds_per_measure) / seconds_per_beat
-
-        while len(measures) <= measure_idx:
-            measures.append({"notes": [], "chords": []})
-
-        measures[measure_idx]["notes"].append(
-            {"abc": pitch_to_abc(note["pitch"]), "beat": beat_in_measure}
-        )
-
-    for chord in chords:
-        measure_idx = int(chord["time"] / seconds_per_measure)
-        if measure_idx < len(measures):
-            measures[measure_idx]["chords"].append(chord["chord"])
-
-    for i, measure in enumerate(measures[:48]):
-        if measure["chords"]:
-            chord_str = measure["chords"][0]
-            abc += f'"{chord_str}"'
-
-        if measure["notes"]:
-            notes_str = " ".join([n["abc"] for n in measure["notes"][:8]])
-            abc += notes_str
-        else:
-            abc += "z4"
-
-        if (i + 1) % 4 == 0:
-            abc += "|\n"
-        else:
-            abc += "|"
-
-    logger.info(f"✅ Lead sheet generated with {len(measures)} measures")
-    return abc
-
-
-def estimate_key(chords: List[dict]) -> str:
-    """Estimate the key from chord progression."""
-    if not chords:
-        return "C"
-
-    chord_counts = {}
+    # Build chord lookup (time in quarter notes -> chord symbol)
+    chord_lookup = {}
     for c in chords:
-        chord = c["chord"]
-        chord_counts[chord] = chord_counts.get(chord, 0) + 1
+        q_time = round(c.time / beat_duration_seconds)  # Snap to beats
+        chord_lookup[q_time] = c.chord
 
-    if chord_counts:
-        most_common = max(chord_counts, key=chord_counts.get)
-        return (
-            most_common.replace("m", "") if most_common.endswith("m") else most_common
-        )
+    # Calculate measures needed
+    if quantized_notes:
+        max_quarters = max(n["start"] + n["duration"] for n in quantized_notes)
+    else:
+        max_quarters = 0
 
-    return "C"
+    num_measures = int(max_quarters / num) + 1
+    num_measures = min(
+        num_measures, 64
+    )  # Cap at 64 measures for better rendering performance
 
+    for measure_num in range(num_measures):
+        m = stream.Measure(number=measure_num + 1)
+        measure_start = measure_num * num
+        measure_end = measure_start + num
 
-def run_separation_sync(job_id: str, youtube_url: str):
-    """Phase 1: Download and separate audio (with caching)."""
-    job_dir = OUTPUT_DIR / job_id
-    job_dir.mkdir(exist_ok=True)
+        # Add chord symbol at start of measure
+        if measure_start in chord_lookup:
+            try:
+                cs = harmony.ChordSymbol(chord_lookup[measure_start])
+                m.insert(0, cs)
+            except:
+                pass
 
-    try:
-        # Extract video ID for caching
-        video_id = extract_video_id(youtube_url)
+        # Get notes in this measure
+        measure_notes = [
+            n for n in quantized_notes if measure_start <= n["start"] < measure_end
+        ]
 
-        if video_id and is_cached(video_id):
-            # Use cached results!
-            logger.info(
-                f"[{job_id[:8]}] 📦 Using cached separation for video: {video_id}"
-            )
+        # Build measure content
+        current_pos = 0.0
 
-            jobs[job_id]["status"] = "loading_cache"
-            jobs[job_id]["message"] = "Loading from cache..."
-            jobs[job_id]["progress"] = 20
-            jobs[job_id]["cached"] = True
+        for n in sorted(measure_notes, key=lambda x: x["start"]):
+            note_offset = n["start"] - measure_start
 
-            # Get cached metadata
-            metadata = get_cached_metadata(video_id)
-            if metadata:
-                jobs[job_id]["video_title"] = metadata.get("title", "")
+            # Add rest if there's a gap
+            if note_offset > current_pos + 0.001:
+                gap = note_offset - current_pos
+                gap_snapped = snap_to_valid_duration(gap)
+                if gap_snapped > 0:
+                    r = note.Rest(quarterLength=gap_snapped)
+                    m.append(r)
+                    current_pos += gap_snapped
 
-            # Copy from cache
-            stems = copy_from_cache(video_id, job_dir)
+            # Calculate note duration (clipped to measure boundary)
+            note_dur = min(n["duration"], measure_end - n["start"])
+            note_dur = snap_to_valid_duration(note_dur)
 
-            # Store stem paths
-            jobs[job_id]["_stems"] = {k: str(v) for k, v in stems.items()}
-            jobs[job_id]["_video_id"] = video_id
+            if note_dur > 0:
+                n_obj = note.Note(n["pitch"], quarterLength=note_dur)
+                m.append(n_obj)
+                current_pos = note_offset + note_dur
 
-            # Create track list for serving
-            tracks = copy_stems_for_serving(job_id, stems)
+        # Fill remaining with rest
+        remaining = num - current_pos
+        if remaining > 0.001:
+            remaining = snap_to_valid_duration(remaining)
+            if remaining > 0:
+                r = note.Rest(quarterLength=remaining)
+                m.append(r)
 
-            # Ready for review
-            jobs[job_id]["status"] = "waiting_review"
-            jobs[job_id]["message"] = (
-                "✨ Loaded from cache! Listen to the tracks and click Continue."
-            )
-            jobs[job_id]["progress"] = 50
-            jobs[job_id]["separated_tracks"] = [t.model_dump() for t in tracks]
+        melody_part.append(m)
 
-            logger.info(f"[{job_id[:8]}] ✅ Loaded from cache, waiting for review")
-            return
+    score.append(melody_part)
 
-        # Not cached - do full processing
-        jobs[job_id]["cached"] = False
+    # Make measures and export
+    melody_part.makeMeasures(inPlace=True)
 
-        # Step 1: Download audio
-        logger.info(f"[{job_id[:8]}] Starting download...")
-        jobs[job_id]["status"] = "downloading"
-        jobs[job_id]["message"] = "Downloading audio from YouTube..."
-        jobs[job_id]["progress"] = 10
-
-        audio_path, video_info = download_audio(youtube_url, job_dir)
-        jobs[job_id]["video_title"] = video_info.get("title", "")
-
-        # Update video_id from actual download if we couldn't extract it earlier
-        if not video_id:
-            video_id = video_info.get("id", "")
-
-        jobs[job_id]["_video_id"] = video_id
-
-        # Step 2: Separate all stems
-        jobs[job_id]["status"] = "separating"
-        jobs[job_id]["message"] = (
-            "Separating audio into stems (vocals, drums, bass, other)..."
-        )
-        jobs[job_id]["progress"] = 30
-
-        stems = separate_all_stems(audio_path, job_dir)
-
-        # Save to cache for future use
-        if video_id:
-            save_to_cache(video_id, stems, video_info)
-
-        # Copy stems for serving
-        tracks = copy_stems_for_serving(job_id, stems)
-
-        # Store stem paths for later use
-        jobs[job_id]["_stems"] = {k: str(v) for k, v in stems.items()}
-
-        # Ready for review
-        jobs[job_id]["status"] = "waiting_review"
-        jobs[job_id]["message"] = (
-            "Separation complete! Listen to the tracks and click Continue when ready."
-        )
-        jobs[job_id]["progress"] = 50
-        jobs[job_id]["separated_tracks"] = [t.model_dump() for t in tracks]
-
-        logger.info(f"[{job_id[:8]}] ✅ Separation complete, waiting for review")
-
-    except Exception as e:
-        logger.error(f"[{job_id[:8]}] ❌ Error: {str(e)}")
-        import traceback
-
-        traceback.print_exc()
-        jobs[job_id]["status"] = "failed"
-        jobs[job_id]["message"] = "Separation failed"
-        jobs[job_id]["error"] = str(e)
-        jobs[job_id]["progress"] = 0
+    # Export to MusicXML
+    xml_path = score.write("musicxml")
+    return xml_path.read_text()
 
 
-def run_transcription_sync(job_id: str):
-    """Phase 2: Transcribe vocals and detect chords."""
-    job_dir = OUTPUT_DIR / job_id
+async def run_step4(job_id: str):
+    """Execute Step 4: Generate MusicXML."""
+    output_dir = get_job_dir(job_id)
 
     try:
-        stems = jobs[job_id].get("_stems", {})
-        vocals_path = Path(stems.get("vocals", job_dir / "vocals.wav"))
-        accompaniment_path = Path(stems.get("other", job_dir / "other.wav"))
+        jobs[job_id].step = JobStep.GENERATING
+        jobs[job_id].message = "Generating lead sheet..."
+        jobs[job_id].progress = 85
 
-        if not vocals_path.exists():
-            vocals_path = job_dir / "original.wav"
-        if not accompaniment_path.exists():
-            accompaniment_path = job_dir / "original.wav"
+        job = jobs[job_id]
 
-        # Step 3: Transcribe vocal melody
-        jobs[job_id]["status"] = "transcribing"
-        jobs[job_id]["message"] = "Transcribing vocal melody..."
-        jobs[job_id]["progress"] = 60
+        # Generate MusicXML
+        musicxml = generate_musicxml(
+            notes=job.melody_notes or [],
+            chords=job.chords or [],
+            bpm=job.bpm or 120.0,
+            key=job.key or "C major",
+            title=job.title or "Untitled",
+            time_sig=job.time_signature,
+        )
 
-        midi_path = transcribe_vocal_melody(vocals_path, job_dir)
+        # Save to file
+        xml_path = output_dir / "lead_sheet.musicxml"
+        xml_path.write_text(musicxml)
 
-        # Step 4: Detect chords
-        jobs[job_id]["status"] = "detecting_chords"
-        jobs[job_id]["message"] = "Detecting chord progression..."
-        jobs[job_id]["progress"] = 75
+        jobs[job_id].music_xml_url = f"/api/musicxml/{job_id}"
 
-        chords = detect_chords(accompaniment_path)
+        print(f"[{job_id}] Generated MusicXML")
 
-        # Step 5: Generate lead sheet
-        jobs[job_id]["status"] = "generating"
-        jobs[job_id]["message"] = "Generating lead sheet..."
-        jobs[job_id]["progress"] = 90
-
-        abc_notation = midi_to_abc_with_chords(midi_path, chords)
-
-        # Save files
-        final_midi_path = job_dir / "vocal_melody.mid"
-        shutil.copy(midi_path, final_midi_path)
-
-        abc_path = job_dir / "lead_sheet.abc"
-        abc_path.write_text(abc_notation)
-
-        chords_path = job_dir / "chords.txt"
-        chord_text = "\n".join([f"{c['time']:.1f}s: {c['chord']}" for c in chords])
-        chords_path.write_text(chord_text)
-
-        # Complete
-        jobs[job_id]["status"] = "completed"
-        jobs[job_id]["message"] = "Lead sheet generated!"
-        jobs[job_id]["progress"] = 100
-        jobs[job_id]["midi_url"] = f"/api/download/{job_id}/midi"
-        jobs[job_id]["abc_notation"] = abc_notation
-        jobs[job_id]["chords"] = chords
-
-        logger.info(f"[{job_id[:8]}] ✅ Lead sheet complete!")
+        jobs[job_id].step = JobStep.COMPLETED
+        jobs[job_id].message = "✓ Lead sheet complete!"
+        jobs[job_id].progress = 100
 
     except Exception as e:
-        logger.error(f"[{job_id[:8]}] ❌ Error: {str(e)}")
-        import traceback
-
-        traceback.print_exc()
-        jobs[job_id]["status"] = "failed"
-        jobs[job_id]["message"] = "Transcription failed"
-        jobs[job_id]["error"] = str(e)
-        jobs[job_id]["progress"] = 0
+        print(f"[{job_id}] Step 4 error: {e}")
+        jobs[job_id].step = JobStep.FAILED
+        jobs[job_id].error = str(e)
+        jobs[job_id].message = "MusicXML generation failed"
 
 
-async def process_separation(job_id: str, youtube_url: str):
-    """Phase 1: Download and separate."""
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(executor, run_separation_sync, job_id, youtube_url)
+# =============================================================================
+# API Endpoints
+# =============================================================================
 
 
-async def process_transcription(job_id: str):
-    """Phase 2: Transcribe."""
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(executor, run_transcription_sync, job_id)
+@app.get("/")
+async def root():
+    return {"message": "Lead Sheet Transcriptor API", "version": "0.2.0"}
 
 
-@app.post("/api/transcribe", response_model=JobStatus)
-async def start_transcription(
-    request: TranscriptionRequest, background_tasks: BackgroundTasks
-):
-    """Start a new transcription job (Phase 1: Download & Separate)."""
+@app.post("/api/process-song", response_model=JobResponse)
+async def create_job(request: ProcessRequest, background_tasks: BackgroundTasks):
+    """Start processing a YouTube URL (Step 1)."""
+
+    video_id = extract_video_id(request.youtube_url)
+    if not video_id:
+        raise HTTPException(status_code=400, detail="Invalid YouTube URL")
+
     job_id = str(uuid.uuid4())
+    jobs[job_id] = JobResponse(
+        job_id=job_id,
+        step=JobStep.IDLE,
+        progress=0,
+        message="Starting download and separation...",
+    )
 
-    logger.info(f"🎬 New job: {job_id[:8]} - {request.youtube_url}")
+    # Store URL for later steps
+    output_dir = get_job_dir(job_id)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "url.txt").write_text(request.youtube_url)
 
-    jobs[job_id] = {
-        "job_id": job_id,
-        "status": "pending",
-        "progress": 0,
-        "message": "Job queued...",
-        "cached": None,
-        "video_title": None,
-        "separated_tracks": None,
-        "midi_url": None,
-        "abc_notation": None,
-        "chords": None,
-        "error": None,
-    }
+    # Start Step 1
+    background_tasks.add_task(run_step1, job_id, request.youtube_url)
 
-    background_tasks.add_task(process_separation, job_id, request.youtube_url)
-
-    return JobStatus(**{k: v for k, v in jobs[job_id].items() if not k.startswith("_")})
+    return jobs[job_id]
 
 
-@app.post("/api/continue/{job_id}", response_model=JobStatus)
-async def continue_transcription(job_id: str, background_tasks: BackgroundTasks):
-    """Continue with transcription after reviewing separated tracks (Phase 2)."""
+@app.post("/api/job/{job_id}/continue", response_model=JobResponse)
+async def continue_job(job_id: str, background_tasks: BackgroundTasks):
+    """Continue to the next step after user review."""
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    if jobs[job_id]["status"] != "waiting_review":
-        raise HTTPException(status_code=400, detail="Job is not waiting for review")
+    job = jobs[job_id]
 
-    logger.info(f"[{job_id[:8]}] Continuing with transcription...")
+    if job.step == JobStep.SEPARATED:
+        # Continue to Step 2: Transcription
+        background_tasks.add_task(run_step2, job_id)
+        job.message = "Starting transcription..."
 
-    jobs[job_id]["status"] = "transcribing"
-    jobs[job_id]["message"] = "Starting transcription..."
+    elif job.step == JobStep.TRANSCRIBED:
+        # Continue to Step 3: Chord Detection
+        background_tasks.add_task(run_step3, job_id)
+        job.message = "Starting chord detection..."
 
-    background_tasks.add_task(process_transcription, job_id)
+    elif job.step == JobStep.CHORDS_DETECTED:
+        # Continue to Step 4: Generate MusicXML
+        background_tasks.add_task(run_step4, job_id)
+        job.message = "Starting MusicXML generation..."
 
-    return JobStatus(**{k: v for k, v in jobs[job_id].items() if not k.startswith("_")})
+    else:
+        raise HTTPException(
+            status_code=400, detail=f"Cannot continue from step: {job.step}"
+        )
+
+    return job
 
 
-@app.get("/api/status/{job_id}", response_model=JobStatus)
-async def get_job_status(job_id: str):
-    """Get the status of a transcription job."""
+@app.get("/api/job/{job_id}", response_model=JobResponse)
+async def get_job(job_id: str):
+    """Get the status of a processing job."""
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
+    return jobs[job_id]
 
-    return JobStatus(**{k: v for k, v in jobs[job_id].items() if not k.startswith("_")})
 
+@app.get("/api/audio/{job_id}/{stem}")
+async def get_audio(job_id: str, stem: str):
+    """Get an audio file (works from cache even if job not in memory)."""
+    output_dir = get_job_dir(job_id)
 
-@app.get("/api/audio/{job_id}/{stem_name}")
-async def get_audio_stem(job_id: str, stem_name: str):
-    """Stream a separated audio stem for preview."""
-    audio_path = OUTPUT_DIR / job_id / f"{stem_name}.wav"
+    if not output_dir.exists():
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    if stem == "vocals":
+        audio_path = output_dir / "htdemucs" / "original" / "vocals.wav"
+    elif stem == "accompaniment":
+        audio_path = output_dir / "htdemucs" / "original" / "no_vocals.wav"
+    elif stem == "original":
+        audio_path = output_dir / "original.wav"
+    elif stem == "melody_midi":
+        audio_path = output_dir / "melody.mid"
+        if audio_path.exists():
+            return FileResponse(audio_path, media_type="audio/midi")
+    else:
+        raise HTTPException(status_code=400, detail="Invalid stem type")
 
     if not audio_path.exists():
-        raise HTTPException(
-            status_code=404, detail=f"Audio stem '{stem_name}' not found"
+        raise HTTPException(status_code=404, detail="Audio file not found")
+
+    return FileResponse(audio_path, media_type="audio/wav")
+
+
+@app.get("/api/musicxml/{job_id}")
+async def get_musicxml(job_id: str):
+    """Get the generated MusicXML file."""
+    # Allow fetching from cache even if job not in memory
+    output_dir = get_job_dir(job_id)
+    xml_path = output_dir / "lead_sheet.musicxml"
+
+    if not xml_path.exists():
+        raise HTTPException(status_code=404, detail="MusicXML file not found")
+
+    return FileResponse(xml_path, media_type="application/xml")
+
+
+@app.post("/api/job/{job_id}/restore", response_model=JobResponse)
+async def restore_job(job_id: str):
+    """Restore a job from cached files on disk."""
+    output_dir = get_job_dir(job_id)
+
+    if not output_dir.exists():
+        raise HTTPException(status_code=404, detail="Job directory not found")
+
+    # Check what files exist
+    has_xml = (output_dir / "lead_sheet.musicxml").exists()
+    has_chords = (output_dir / "chords.json").exists()
+    has_midi = (output_dir / "melody.mid").exists()
+    has_vocals = (output_dir / "htdemucs" / "original" / "vocals.wav").exists()
+    has_accompaniment = (
+        output_dir / "htdemucs" / "original" / "no_vocals.wav"
+    ).exists()
+    has_original = (output_dir / "original.wav").exists()
+
+    # If we have chords and midi but no XML, regenerate it
+    if has_chords and has_midi and not has_xml:
+        try:
+            # Load chords data
+            with open(output_dir / "chords.json") as f:
+                chords_data = json.load(f)
+                key = chords_data.get("key", "C major")
+                chords = [ChordEvent(**c) for c in chords_data.get("chords", [])]
+            
+            # Load melody notes from MIDI
+            import pretty_midi
+            
+            midi = pretty_midi.PrettyMIDI(str(output_dir / "melody.mid"))
+            notes = []
+            for instrument in midi.instruments:
+                for n in instrument.notes:
+                    notes.append(MelodyNote(
+                        pitch=n.pitch,  # MIDI note number
+                        start_time=n.start,
+                        duration=n.end - n.start,
+                        velocity=n.velocity
+                    ))
+            
+            # Get BPM
+            y, sr = librosa.load(
+                str(output_dir / "htdemucs" / "original" / "no_vocals.wav"), sr=22050
+            )
+            tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
+            bpm = float(tempo) if isinstance(tempo, (int, float)) else float(tempo[0])
+            
+            # Get title
+            title = "Restored Job"
+            url_file = output_dir / "url.txt"
+            if url_file.exists():
+                title = url_file.read_text().strip()
+            
+            # Generate MusicXML
+            musicxml = generate_musicxml(notes, chords, bpm, key, title)
+            xml_path = output_dir / "lead_sheet.musicxml"
+            xml_path.write_text(musicxml)
+            has_xml = True
+            print(f"Regenerated MusicXML for job {job_id}")
+        except Exception as e:
+            print(f"Failed to regenerate MusicXML: {e}")
+    
+    # Determine the step based on what's available
+    if has_xml:
+        step = JobStep.COMPLETED
+        progress = 100
+        message = "✓ Restored from cache - Lead sheet complete!"
+    elif has_chords:
+        step = JobStep.CHORDS_DETECTED
+        progress = 80
+        message = "Restored from cache - Ready to generate lead sheet"
+    elif has_midi:
+        step = JobStep.TRANSCRIBED
+        progress = 60
+        message = "Restored from cache - Ready to detect chords"
+    elif has_vocals:
+        step = JobStep.SEPARATED
+        progress = 40
+        message = "Restored from cache - Ready to transcribe"
+    else:
+        raise HTTPException(status_code=404, detail="Not enough cached data to restore")
+
+    # Load chords if available
+    chords = None
+    key = None
+    if has_chords:
+        with open(output_dir / "chords.json") as f:
+            chords_data = json.load(f)
+            key = chords_data.get("key")
+            chords = [ChordEvent(**c) for c in chords_data.get("chords", [])]
+
+    # Get title from URL file if available
+    title = "Restored Job"
+    url_file = output_dir / "url.txt"
+    if url_file.exists():
+        title = url_file.read_text().strip()
+
+    # Get duration and BPM from audio if available
+    duration = None
+    bpm = None
+    if has_original:
+        duration = librosa.get_duration(path=str(output_dir / "original.wav"))
+    if has_accompaniment:
+        y, sr = librosa.load(
+            str(output_dir / "htdemucs" / "original" / "no_vocals.wav"), sr=22050
         )
+        tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
+        bpm = float(tempo) if isinstance(tempo, (int, float)) else float(tempo[0])
 
-    return FileResponse(audio_path, media_type="audio/wav", filename=f"{stem_name}.wav")
+    # Create job response
+    jobs[job_id] = JobResponse(
+        job_id=job_id,
+        step=step,
+        progress=progress,
+        message=message,
+        title=title,
+        duration=duration,
+        bpm=bpm,
+        key=key,
+        vocals_url=f"/api/audio/{job_id}/vocals" if has_vocals else None,
+        accompaniment_url=f"/api/audio/{job_id}/accompaniment"
+        if has_accompaniment
+        else None,
+        original_url=f"/api/audio/{job_id}/original" if has_original else None,
+        melody_midi_url=f"/api/audio/{job_id}/melody_midi" if has_midi else None,
+        chords=chords,
+        music_xml_url=f"/api/musicxml/{job_id}" if has_xml else None,
+    )
 
-
-@app.get("/api/download/{job_id}/midi")
-async def download_midi(job_id: str):
-    """Download the generated MIDI file."""
-    midi_path = OUTPUT_DIR / job_id / "vocal_melody.mid"
-
-    if not midi_path.exists():
-        raise HTTPException(status_code=404, detail="MIDI file not found")
-
-    return FileResponse(midi_path, media_type="audio/midi", filename="vocal_melody.mid")
-
-
-@app.get("/api/download/{job_id}/abc")
-async def download_abc(job_id: str):
-    """Download the ABC notation file."""
-    abc_path = OUTPUT_DIR / job_id / "lead_sheet.abc"
-
-    if not abc_path.exists():
-        raise HTTPException(status_code=404, detail="ABC file not found")
-
-    return FileResponse(abc_path, media_type="text/plain", filename="lead_sheet.abc")
-
-
-@app.get("/api/download/{job_id}/chords")
-async def download_chords(job_id: str):
-    """Download the chord progression."""
-    chords_path = OUTPUT_DIR / job_id / "chords.txt"
-
-    if not chords_path.exists():
-        raise HTTPException(status_code=404, detail="Chords file not found")
-
-    return FileResponse(chords_path, media_type="text/plain", filename="chords.txt")
+    return jobs[job_id]
 
 
-@app.delete("/api/cache")
-async def clear_cache():
-    """Clear all cached separations."""
-    import shutil
+@app.get("/api/jobs/cached")
+async def list_cached_jobs():
+    """List all job directories with cached data."""
+    cached = []
+    for job_dir in OUTPUTS_DIR.iterdir():
+        if job_dir.is_dir():
+            job_id = job_dir.name
+            has_xml = (job_dir / "lead_sheet.musicxml").exists()
+            has_vocals = (job_dir / "htdemucs" / "original" / "vocals.wav").exists()
 
-    if CACHE_DIR.exists():
-        shutil.rmtree(CACHE_DIR)
-        CACHE_DIR.mkdir(exist_ok=True)
+            # Get title
+            title = job_id
+            url_file = job_dir / "url.txt"
+            if url_file.exists():
+                title = url_file.read_text().strip()[:50]
 
-    logger.info("🗑️ Cache cleared")
-    return {"status": "ok", "message": "Cache cleared"}
-
-
-@app.get("/api/cache")
-async def list_cache():
-    """List all cached videos."""
-    cached_videos = []
-
-    if CACHE_DIR.exists():
-        for video_dir in CACHE_DIR.iterdir():
-            if video_dir.is_dir():
-                metadata = get_cached_metadata(video_dir.name)
-                cached_videos.append(
-                    {
-                        "video_id": video_dir.name,
-                        "title": metadata.get("title", "Unknown")
-                        if metadata
-                        else "Unknown",
-                    }
-                )
-
-    return {"cached_videos": cached_videos, "count": len(cached_videos)}
+            cached.append(
+                {
+                    "job_id": job_id,
+                    "title": title,
+                    "has_musicxml": has_xml,
+                    "has_stems": has_vocals,
+                }
+            )
+    return cached
 
 
-@app.get("/api/health")
-async def health_check():
-    """Health check endpoint."""
-    return {"status": "healthy"}
-
+# =============================================================================
+# Run Server
+# =============================================================================
 
 if __name__ == "__main__":
     import uvicorn
 
-    logger.info("🎤 Starting Nasum Transcriptor API (Vocal + Chords)...")
     uvicorn.run(app, host="0.0.0.0", port=8000)
