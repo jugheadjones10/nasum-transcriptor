@@ -36,6 +36,11 @@ OUTPUTS_DIR.mkdir(exist_ok=True)
 CACHE_DIR.mkdir(exist_ok=True)
 
 # =============================================================================
+# Key and BPM are now provided by user input - automatic detection removed
+# =============================================================================
+
+
+# =============================================================================
 # FastAPI App
 # =============================================================================
 
@@ -93,6 +98,8 @@ class ChordEvent(BaseModel):
 
 class ProcessRequest(BaseModel):
     youtube_url: str
+    key: str  # e.g., "C major", "A minor"
+    bpm: int  # 20-300
 
 
 class JobResponse(BaseModel):
@@ -175,8 +182,8 @@ async def download_audio(
 
     output_template = str(output_dir / "original.%(ext)s")
 
-    # First, get the title
-    title_cmd = ["yt-dlp", "--print", "%(title)s", "--no-playlist", youtube_url]
+    # First, get the title (use browser cookies to avoid bot detection)
+    title_cmd = ["yt-dlp", "--cookies-from-browser", "chrome", "--print", "%(title)s", "--no-playlist", youtube_url]
     title_result = await asyncio.create_subprocess_exec(
         *title_cmd,
         stdout=asyncio.subprocess.PIPE,
@@ -189,36 +196,104 @@ async def download_audio(
     jobs[job_id].title = title
     jobs[job_id].progress = 8
 
-    # Then download the audio
-    cmd = [
-        "yt-dlp",
-        "-f",
-        "bestaudio",
-        "-x",
-        "--audio-format",
-        "wav",
-        "-o",
-        output_template,
-        "--no-playlist",
-        "--no-warnings",
-        youtube_url,
-    ]
+    async def run_download(format_selector: Optional[str]):
+        cmd = [
+            "yt-dlp",
+            "--cookies-from-browser",
+            "chrome",
+            "-x",
+            "--audio-format",
+            "wav",
+            "-o",
+            output_template,
+            "--no-playlist",
+            "--no-warnings",
+        ]
+        if format_selector:
+            cmd += ["-f", format_selector]
+        cmd.append(youtube_url)
 
-    print(f"[{job_id}] Downloading with: {' '.join(cmd)}")
+        print(f"[{job_id}] Downloading with: {' '.join(cmd)}")
 
-    result = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout, stderr = await result.communicate()
+        result = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await result.communicate()
+        stderr_text = stderr.decode() if stderr else ""
 
-    print(f"[{job_id}] yt-dlp exit code: {result.returncode}")
-    if stderr:
-        print(f"[{job_id}] yt-dlp stderr: {stderr.decode()[:500]}")
+        print(f"[{job_id}] yt-dlp exit code: {result.returncode}")
+        if stderr_text:
+            print(f"[{job_id}] yt-dlp stderr: {stderr_text[:500]}")
 
-    if result.returncode != 0:
-        raise Exception(f"yt-dlp failed: {stderr.decode()}")
+        return result, stderr_text
+
+    async def select_best_format_id() -> Optional[str]:
+        info_cmd = [
+            "yt-dlp",
+            "--cookies-from-browser",
+            "chrome",
+            "--dump-json",
+            "--no-playlist",
+            youtube_url,
+        ]
+        info_result = await asyncio.create_subprocess_exec(
+            *info_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        info_stdout, _ = await info_result.communicate()
+        if info_result.returncode != 0 or not info_stdout:
+            return None
+
+        try:
+            info = json.loads(info_stdout.decode().strip().splitlines()[-1])
+        except Exception:
+            return None
+
+        formats = info.get("formats") or []
+        audio_formats = [
+            f
+            for f in formats
+            if f.get("vcodec") == "none" and f.get("acodec") not in (None, "none")
+        ]
+        if audio_formats:
+            best_audio = max(
+                audio_formats,
+                key=lambda f: f.get("abr") or f.get("tbr") or 0,
+            )
+            return best_audio.get("format_id")
+
+        if formats:
+            best_overall = max(formats, key=lambda f: f.get("tbr") or 0)
+            return best_overall.get("format_id")
+
+        return None
+
+    formats_to_try: list[Optional[str]] = ["bestaudio/best", "bestaudio", "best", None]
+    result = None
+    last_error = ""
+
+    for format_selector in formats_to_try:
+        result, stderr_text = await run_download(format_selector)
+        if result.returncode == 0:
+            break
+        last_error = stderr_text
+        if "Requested format is not available" not in stderr_text:
+            raise Exception(f"yt-dlp failed: {stderr_text}")
+
+    if result is None or result.returncode != 0:
+        if "Requested format is not available" in last_error:
+            format_id = await select_best_format_id()
+            if format_id:
+                result, stderr_text = await run_download(format_id)
+                if result.returncode != 0:
+                    raise Exception(f"yt-dlp failed: {stderr_text}")
+            else:
+                raise Exception(f"yt-dlp failed: {last_error}")
+        else:
+            raise Exception(f"yt-dlp failed: {last_error}")
 
     audio_path = output_dir / "original.wav"
 
@@ -305,12 +380,9 @@ async def run_step1(job_id: str, youtube_url: str):
         )
         print(f"[{job_id}] Separated stems")
 
-        # Detect BPM from accompaniment
-        y, sr = librosa.load(str(accompaniment_path), sr=22050)
-        tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
-        jobs[job_id].bpm = (
-            float(tempo) if isinstance(tempo, (int, float)) else float(tempo[0])
-        )
+        # BPM is already set from user input at job creation
+        # No automatic detection needed
+        print(f"[{job_id}] Using user-provided BPM: {jobs[job_id].bpm}")
 
         jobs[job_id].step = JobStep.SEPARATED
         jobs[
@@ -514,25 +586,7 @@ def detect_chords_from_audio(audio_path: Path, bpm: float) -> list[ChordEvent]:
     return chords
 
 
-def detect_key(audio_path: Path) -> str:
-    """Detect the musical key of the audio."""
-    y, sr = librosa.load(str(audio_path), sr=22050)
-    chroma = librosa.feature.chroma_cqt(y=y, sr=sr)
-    chroma_avg = np.mean(chroma, axis=1)
-
-    # Simple key detection: find the most prominent pitch class
-    # and determine if major or minor based on third
-    root = np.argmax(chroma_avg)
-    root_name = NOTE_NAMES[root]
-
-    # Check major vs minor (look at relative strength of major/minor third)
-    major_third = chroma_avg[(root + 4) % 12]
-    minor_third = chroma_avg[(root + 3) % 12]
-
-    if major_third > minor_third:
-        return f"{root_name} major"
-    else:
-        return f"{root_name} minor"
+## detect_key() function removed - key is now provided by user input
 
 
 async def run_step3(job_id: str):
@@ -550,21 +604,22 @@ async def run_step3(job_id: str):
         # Detect chords
         chords = detect_chords_from_audio(accompaniment_path, bpm)
 
-        # Detect key
-        key = detect_key(accompaniment_path)
+        # Key is already set from user input at job creation
+        # No automatic detection needed
+        key = jobs[job_id].key or "C major"
 
         jobs[job_id].chords = chords
-        jobs[job_id].key = key
+        # key is already set, no need to update
 
-        print(f"[{job_id}] Detected {len(chords)} chord changes, key: {key}")
+        print(f"[{job_id}] Detected {len(chords)} chord changes, using user-provided key: {key}")
 
-        # Save chords to file
+        # Save chords to file (include key and bpm for restore)
         chords_data = [
             {"time": c.time, "chord": c.chord, "confidence": c.confidence}
             for c in chords
         ]
         with open(output_dir / "chords.json", "w") as f:
-            json.dump({"key": key, "chords": chords_data}, f, indent=2)
+            json.dump({"key": key, "bpm": bpm, "chords": chords_data}, f, indent=2)
 
         jobs[job_id].step = JobStep.CHORDS_DETECTED
         jobs[
@@ -638,28 +693,19 @@ def generate_musicxml(
     num, denom = map(int, time_sig.split("/"))
     melody_part.append(meter.TimeSignature(time_sig))
 
-    # Add key signature
-    # music21 accepts both "C#" and "c#" for sharp keys
+    # Add key signature - STRICTLY use the user-provided key
+    print(f"[generate_musicxml] User-provided key: {key}")
     key_name = key.split()[0] if key else "C"
     is_minor = "minor" in key.lower() if key else False
-    
-    # Use enharmonic equivalents for keys with > 6 sharps/flats
-    # These are unusual keys that OSMD can't render
-    enharmonic_map = {
-        "G#": "Ab", "A#": "Bb", "D#": "Eb", "E#": "F",
-        "B#": "C", "Fb": "E", "Cb": "B",
-        # Also map double sharps/flats
-        "F##": "G", "C##": "D", "G##": "A", "D##": "E", "A##": "B", "E##": "F#", "B##": "C#",
-    }
-    if key_name in enharmonic_map:
-        key_name = enharmonic_map[key_name]
-    
+    print(f"[generate_musicxml] Parsed key_name: {key_name}, is_minor: {is_minor}")
+
     try:
         ks = m21key.Key(key_name, "minor" if is_minor else "major")
         melody_part.append(ks)
+        print(f"[generate_musicxml] Created key signature: {ks}")
     except Exception as e:
-        print(f"Could not create key signature for {key}: {e}")
-        # Fall back to C major
+        print(f"[generate_musicxml] Could not create key signature for {key}: {e}")
+        # Fall back to C major only if key creation fails
         try:
             ks = m21key.Key("C", "major")
             melody_part.append(ks)
@@ -780,7 +826,10 @@ async def run_step4(job_id: str):
 
         job = jobs[job_id]
 
-        # Generate MusicXML
+        # Log the user-provided key and BPM
+        print(f"[{job_id}] Generating MusicXML with user-provided key: {job.key}, bpm: {job.bpm}")
+
+        # Generate MusicXML - STRICTLY use user-provided key and bpm
         musicxml = generate_musicxml(
             notes=job.melody_notes or [],
             chords=job.chords or [],
@@ -819,6 +868,12 @@ async def root():
     return {"message": "Lead Sheet Transcriptor API", "version": "0.2.0"}
 
 
+# Valid key notes and modes
+# Valid key notes (includes both sharps and flats)
+VALID_NOTES = ["C", "C#", "Db", "D", "D#", "Eb", "E", "F", "F#", "Gb", "G", "G#", "Ab", "A", "A#", "Bb", "B"]
+VALID_MODES = ["major", "minor"]
+
+
 @app.post("/api/process-song", response_model=JobResponse)
 async def create_job(request: ProcessRequest, background_tasks: BackgroundTasks):
     """Start processing a YouTube URL (Step 1)."""
@@ -827,12 +882,39 @@ async def create_job(request: ProcessRequest, background_tasks: BackgroundTasks)
     if not video_id:
         raise HTTPException(status_code=400, detail="Invalid YouTube URL")
 
+    # Validate key
+    key_parts = request.key.split(" ")
+    if len(key_parts) != 2:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid key format: must be '{note} {mode}' (e.g., 'C major')",
+        )
+    note, mode = key_parts
+    if note not in VALID_NOTES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid key note: must be one of {', '.join(VALID_NOTES)}",
+        )
+    if mode not in VALID_MODES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid key mode: must be one of {', '.join(VALID_MODES)}",
+        )
+
+    # Validate BPM
+    if request.bpm < 20 or request.bpm > 300:
+        raise HTTPException(
+            status_code=400, detail="Invalid BPM: must be between 20 and 300"
+        )
+
     job_id = str(uuid.uuid4())
     jobs[job_id] = JobResponse(
         job_id=job_id,
         step=JobStep.IDLE,
         progress=0,
         message="Starting download and separation...",
+        key=request.key,  # Store user-provided key
+        bpm=float(request.bpm),  # Store user-provided BPM
     )
 
     # Store URL for later steps
@@ -946,15 +1028,16 @@ async def restore_job(job_id: str):
     # If we have chords and midi but no XML, regenerate it
     if has_chords and has_midi and not has_xml:
         try:
-            # Load chords data
+            # Load chords data (includes key and bpm from user input)
             with open(output_dir / "chords.json") as f:
                 chords_data = json.load(f)
                 key = chords_data.get("key", "C major")
+                bpm = chords_data.get("bpm", 120.0)  # Read BPM from cache
                 chords = [ChordEvent(**c) for c in chords_data.get("chords", [])]
-            
+
             # Load melody notes from MIDI
             import pretty_midi
-            
+
             midi = pretty_midi.PrettyMIDI(str(output_dir / "melody.mid"))
             notes = []
             for instrument in midi.instruments:
@@ -965,13 +1048,6 @@ async def restore_job(job_id: str):
                         duration=n.end - n.start,
                         velocity=n.velocity
                     ))
-            
-            # Get BPM
-            y, sr = librosa.load(
-                str(output_dir / "htdemucs" / "original" / "no_vocals.wav"), sr=22050
-            )
-            tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
-            bpm = float(tempo) if isinstance(tempo, (int, float)) else float(tempo[0])
             
             # Get title
             title = "Restored Job"
@@ -1023,17 +1099,21 @@ async def restore_job(job_id: str):
     if url_file.exists():
         title = url_file.read_text().strip()
 
-    # Get duration and BPM from audio if available
+    # Get duration from audio if available
     duration = None
-    bpm = None
     if has_original:
         duration = librosa.get_duration(path=str(output_dir / "original.wav"))
-    if has_accompaniment:
-        y, sr = librosa.load(
-            str(output_dir / "htdemucs" / "original" / "no_vocals.wav"), sr=22050
-        )
-        tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
-        bpm = float(tempo) if isinstance(tempo, (int, float)) else float(tempo[0])
+
+    # BPM is read from chords.json (stored from user input)
+    # If no chords.json, use default
+    bpm = None
+    if has_chords:
+        try:
+            with open(output_dir / "chords.json") as f:
+                chords_data = json.load(f)
+                bpm = chords_data.get("bpm", 120.0)
+        except Exception:
+            bpm = 120.0
 
     # Create job response
     jobs[job_id] = JobResponse(

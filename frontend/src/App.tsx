@@ -230,7 +230,7 @@ function StepIndicator({ currentStep, isProcessing }: { currentStep: JobStep; is
   );
 }
 
-function MelodyPreview({ notes, bpm }: { notes: MelodyNote[]; bpm: number }) {
+function MelodyPreview({ notes }: { notes: MelodyNote[] }) {
   const [showAll, setShowAll] = useState(false);
   const displayNotes = showAll ? notes : notes.slice(0, 20);
 
@@ -453,6 +453,10 @@ interface CachedJob {
   has_stems: boolean;
 }
 
+// Musical key constants (includes both sharps and flats)
+const NOTES = ['C', 'C#', 'Db', 'D', 'D#', 'Eb', 'E', 'F', 'F#', 'Gb', 'G', 'G#', 'Ab', 'A', 'A#', 'Bb', 'B'] as const;
+const MODES = ['major', 'minor'] as const;
+
 export default function App() {
   const [url, setUrl] = useState('');
   const [job, setJob] = useState<Job | null>(null);
@@ -461,6 +465,11 @@ export default function App() {
   const [cachedJobs, setCachedJobs] = useState<CachedJob[]>([]);
   const [showCached, setShowCached] = useState(false);
   const [isRestoring, setIsRestoring] = useState(false);
+
+  // Key and BPM inputs
+  const [selectedNote, setSelectedNote] = useState<string>('C');
+  const [selectedMode, setSelectedMode] = useState<string>('major');
+  const [bpm, setBpm] = useState<number>(120);
 
   const isProcessing = job && !['separated', 'transcribed', 'chords_detected', 'completed', 'failed'].includes(job.step);
 
@@ -510,6 +519,12 @@ export default function App() {
     e.preventDefault();
     if (!url.trim() || isSubmitting) return;
 
+    // Validate BPM
+    if (bpm < 20 || bpm > 300) {
+      alert('BPM must be between 20 and 300');
+      return;
+    }
+
     setIsSubmitting(true);
     setJob(null);
 
@@ -517,7 +532,11 @@ export default function App() {
       const response = await fetch(`${API_BASE}/api/process-song`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ youtube_url: url }),
+        body: JSON.stringify({
+          youtube_url: url,
+          key: `${selectedNote} ${selectedMode}`,
+          bpm: bpm,
+        }),
       });
 
       if (!response.ok) {
@@ -600,32 +619,89 @@ export default function App() {
               <label htmlFor="youtube-url" className="block text-sm font-medium mb-2">
                 YouTube URL
               </label>
-              <div className="flex gap-3">
-                <input
-                  id="youtube-url"
-                  type="url"
-                  value={url}
-                  onChange={(e) => setUrl(e.target.value)}
-                  placeholder="https://www.youtube.com/watch?v=..."
-                  className="flex-1 px-4 py-3 bg-[var(--color-surface)] border border-[var(--color-border)] rounded-xl text-[var(--color-text)] placeholder:text-[var(--color-text-muted)] focus:outline-none focus:ring-2 focus:ring-[var(--color-accent)] focus:border-transparent transition-all"
-                  disabled={isSubmitting || (job && isProcessing)}
-                />
-                <button
-                  type="submit"
-                  disabled={!url.trim() || isSubmitting || (job && isProcessing)}
-                  className="px-6 py-3 bg-[var(--color-accent)] text-[var(--color-bg)] font-semibold rounded-xl hover:bg-[var(--color-accent-hover)] disabled:opacity-50 disabled:cursor-not-allowed transition-all flex items-center gap-2"
+              <input
+                id="youtube-url"
+                type="url"
+                value={url}
+                onChange={(e) => setUrl(e.target.value)}
+                placeholder="https://www.youtube.com/watch?v=..."
+                className="w-full px-4 py-3 bg-[var(--color-surface)] border border-[var(--color-border)] rounded-xl text-[var(--color-text)] placeholder:text-[var(--color-text-muted)] focus:outline-none focus:ring-2 focus:ring-[var(--color-accent)] focus:border-transparent transition-all"
+                disabled={isSubmitting || !!(job && isProcessing)}
+              />
+            </div>
+
+            {/* Key and BPM inputs */}
+            <div className="grid grid-cols-3 gap-4">
+              {/* Key Note Selection */}
+              <div>
+                <label htmlFor="key-note" className="block text-sm font-medium mb-2">
+                  Key
+                </label>
+                <select
+                  id="key-note"
+                  value={selectedNote}
+                  onChange={(e) => setSelectedNote(e.target.value)}
+                  disabled={isSubmitting || !!(job && isProcessing)}
+                  className="w-full px-4 py-3 bg-[var(--color-surface)] border border-[var(--color-border)] rounded-xl text-[var(--color-text)] focus:outline-none focus:ring-2 focus:ring-[var(--color-accent)] focus:border-transparent transition-all"
                 >
-                  {isSubmitting ? (
-                    <>
-                      <Loader2 className="w-5 h-5 animate-spin" />
-                      Starting
-                    </>
-                  ) : (
-                    'Start'
-                  )}
-                </button>
+                  {NOTES.map((note) => (
+                    <option key={note} value={note}>{note}</option>
+                  ))}
+                </select>
+              </div>
+
+              {/* Mode Selection */}
+              <div>
+                <label htmlFor="key-mode" className="block text-sm font-medium mb-2">
+                  Mode
+                </label>
+                <select
+                  id="key-mode"
+                  value={selectedMode}
+                  onChange={(e) => setSelectedMode(e.target.value)}
+                  disabled={isSubmitting || !!(job && isProcessing)}
+                  className="w-full px-4 py-3 bg-[var(--color-surface)] border border-[var(--color-border)] rounded-xl text-[var(--color-text)] focus:outline-none focus:ring-2 focus:ring-[var(--color-accent)] focus:border-transparent transition-all"
+                >
+                  {MODES.map((mode) => (
+                    <option key={mode} value={mode}>{mode}</option>
+                  ))}
+                </select>
+              </div>
+
+              {/* BPM Input */}
+              <div>
+                <label htmlFor="bpm" className="block text-sm font-medium mb-2">
+                  BPM
+                </label>
+                <input
+                  id="bpm"
+                  type="number"
+                  min="20"
+                  max="300"
+                  value={bpm}
+                  onChange={(e) => setBpm(parseInt(e.target.value) || 120)}
+                  placeholder="120"
+                  disabled={isSubmitting || !!(job && isProcessing)}
+                  className="w-full px-4 py-3 bg-[var(--color-surface)] border border-[var(--color-border)] rounded-xl text-[var(--color-text)] placeholder:text-[var(--color-text-muted)] focus:outline-none focus:ring-2 focus:ring-[var(--color-accent)] focus:border-transparent transition-all"
+                />
               </div>
             </div>
+
+            {/* Submit Button */}
+            <button
+              type="submit"
+              disabled={!url.trim() || isSubmitting || (job && isProcessing) || bpm < 20 || bpm > 300}
+              className="w-full px-6 py-3 bg-[var(--color-accent)] text-[var(--color-bg)] font-semibold rounded-xl hover:bg-[var(--color-accent-hover)] disabled:opacity-50 disabled:cursor-not-allowed transition-all flex items-center justify-center gap-2"
+            >
+              {isSubmitting ? (
+                <>
+                  <Loader2 className="w-5 h-5 animate-spin" />
+                  Starting
+                </>
+              ) : (
+                'Start Transcription'
+              )}
+            </button>
           </form>
         </section>
 
@@ -733,7 +809,7 @@ export default function App() {
                   <FileMusic className="w-5 h-5 text-[var(--color-accent)]" />
                   Melody Transcription
                 </h3>
-                <MelodyPreview notes={job.melody_notes} bpm={job.bpm || 120} />
+                <MelodyPreview notes={job.melody_notes} />
                 {job.melody_midi_url && (
                   <a
                     href={`${API_BASE}${job.melody_midi_url}`}

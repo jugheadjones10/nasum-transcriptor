@@ -24,3 +24,5 @@ frontend/dist/
 # Environment
 .env
 .env.local
+/.ttadk
+/.claude
